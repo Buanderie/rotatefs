@@ -41,6 +41,7 @@
 #include <limits.h>
 #include <sys/types.h>
 #include <libgen.h>
+#include <ctype.h> /* for tolower */
 
 struct rfs_state {
     char *rootdir;
@@ -55,14 +56,51 @@ static struct options {
     size_t max_device_size;
 } options;
 
+static int parse_size(const char *str, size_t *result) {
+    char *endptr;
+    unsigned long long num = strtoull(str, &endptr, 10);
+    if (num == ULLONG_MAX && errno == ERANGE) {
+        return -1;
+    }
+    if (endptr == str) {
+        return -1;
+    }
+    size_t mult = 1;
+    if (*endptr != '\0') {
+        char unit = tolower(*endptr);
+        endptr++;
+        switch (unit) {
+            case 'k':
+                mult = 1024;
+                break;
+            case 'm':
+                mult = 1024UL * 1024;
+                break;
+            case 'g':
+                mult = 1024UL * 1024 * 1024;
+                break;
+            default:
+                return -1;
+        }
+        // Skip any trailing whitespace or ensure no extra chars
+        while (isspace(*endptr)) endptr++;
+        if (*endptr != '\0') {
+            return -1;
+        }
+    }
+    *result = (size_t)num * mult;
+    return 0;
+}
+
 int save_older (const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
 {
-
     if (typeflag != FTW_F) return 0;
 
     if (RFS_DATA->files_traversed == 0 || sb->st_mtime < RFS_DATA->oldest_mtime) {
         strcpy(RFS_DATA->oldest_path, fpath);
         RFS_DATA->oldest_mtime = sb->st_mtime;
+        RFS_DATA->files_traversed++;
+    } else {
         RFS_DATA->files_traversed++;
     }
 
@@ -113,9 +151,16 @@ int delete_oldest()
 {
     int res;
 
+    RFS_DATA->files_traversed = 0;
+    RFS_DATA->oldest_mtime = 0;
+
     if (nftw(RFS_DATA->rootdir, save_older, FOPEN_MAX, FTW_MOUNT | FTW_PHYS) != 0) {
-        perror("error ocurred: ");
+        perror("error occurred: ");
         return -errno;
+    }
+
+    if (RFS_DATA->files_traversed == 0) {
+        return 0;  // No files to delete
     }
 
     res = unlink(RFS_DATA->oldest_path);
@@ -129,7 +174,9 @@ int delete_oldest()
 }
 
 int sum(const char *fpath, const struct stat *sb, int typeflag) {
-    RFS_DATA->directory_usage += sb->st_size;
+    if (typeflag == FTW_F) {
+        RFS_DATA->directory_usage += sb->st_size;
+    }
     return 0;
 }
 
@@ -138,40 +185,39 @@ size_t current_size(char *rootdir)
     RFS_DATA->directory_usage = 0;
 
     if (ftw(rootdir, &sum, 1))
-        return -errno;
+        return (size_t)-errno;
     else
         return RFS_DATA->directory_usage;
 }
 
-size_t device_size(char *rootdir)
+size_t underlying_device_size(char *rootdir)
 {
     int res;
     size_t fsize;
-    size_t max_device_size = options.max_device_size;
     struct statvfs *stbuf = malloc(sizeof(struct statvfs));
 
     res = statvfs(rootdir, stbuf);
     fsize = stbuf->f_bsize * stbuf->f_blocks;
     free(stbuf);
     if (res == -1) {
-        return -errno;
+        return (size_t)-errno;
     }
 
-    if (max_device_size > 0)
-        return (fsize < max_device_size ? fsize : max_device_size);
-    else
-        return fsize;
+    return fsize;
 }
 
-void trim_fs(size_t size)
+void trim_fs(size_t added)
 {
-    if (device_size(RFS_DATA->rootdir) < size) 
-        return;
-
-    while (device_size(RFS_DATA->rootdir) < (current_size(RFS_DATA->rootdir) + size)) {
-        fprintf(stderr, "device_size: %ld; current_size: %ld\n", device_size(RFS_DATA->rootdir), current_size(RFS_DATA->rootdir));
+    size_t cap = options.max_device_size;
+    if (cap == 0) {
+        return;  // No limit
+    }
+    size_t target = cap > added ? cap - added : 0;
+    while (current_size(RFS_DATA->rootdir) > target) {
+        fprintf(stderr, "Trimming: current %zu > target %zu (cap %zu, added %zu)\n",
+                current_size(RFS_DATA->rootdir), target, cap, added);
         if (delete_oldest() != 0) {
-            return;
+            break;
         }
     }
 }
@@ -462,6 +508,17 @@ static int rfs_truncate(const char *path, off_t size)
         char fpath[PATH_MAX];
 
         fullpath(fpath, path);
+
+        // Proactive trim if growing the file
+        struct stat st;
+        off_t old_size = 0;
+        if (lstat(fpath, &st) == 0 && S_ISREG(st.st_mode)) {
+            old_size = st.st_size;
+            if (size > old_size) {
+                trim_fs((size_t)(size - old_size));
+            }
+        }
+
 	res = truncate(fpath, size);
 	if (res == -1)
 		return -errno;
@@ -475,6 +532,16 @@ static int rfs_ftruncate(const char *path, off_t size,
 	int res;
 
 	(void) path;
+
+        // Proactive trim if growing (but hard without old size; conservative)
+        struct stat st;
+        off_t old_size = 0;
+        if (fstat(fi->fh, &st) == 0 && S_ISREG(st.st_mode)) {
+            old_size = st.st_size;
+            if (size > old_size) {
+                trim_fs((size_t)(size - old_size));
+            }
+        }
 
 	res = ftruncate(fi->fh, size);
 	if (res == -1)
@@ -574,13 +641,20 @@ static int rfs_write(const char *path, const char *buf, size_t size,
 
 	(void) path;
 
-        trim_fs(size);
-        for (res = pwrite(fi->fh, buf, size, offset); res == -1 && errno == ENOSPC; res = pwrite(fi->fh, buf, size, offset)) {
-            fprintf(stderr, "device_size: %ld; size: %ld\n", device_size(RFS_DATA->rootdir), size);
-            if (device_size(RFS_DATA->rootdir) < size || delete_oldest(RFS_DATA->rootdir) != 0) {
-                break;
-            }
+    trim_fs(size);
+
+    size_t cap = options.max_device_size;
+    res = pwrite(fi->fh, buf, size, offset);
+    while (res == -1 && errno == ENOSPC) {
+        if (cap > 0 && cap < size) {
+            break;  // Can't make space for this large write
         }
+        fprintf(stderr, "Fallback trim: cap %zu, write size %zu\n", cap, size);
+        if (delete_oldest() != 0) {
+            break;
+        }
+        res = pwrite(fi->fh, buf, size, offset);
+    }
 	
 	if (res == -1)
 		res = -errno;
@@ -592,7 +666,7 @@ static int rfs_write_buf(const char *path, struct fuse_bufvec *buf,
 		     off_t offset, struct fuse_file_info *fi)
 {
 	struct fuse_bufvec dst = FUSE_BUFVEC_INIT(fuse_buf_size(buf));
-        int res;
+    int res;
 
 	(void) path;
 
@@ -600,13 +674,21 @@ static int rfs_write_buf(const char *path, struct fuse_bufvec *buf,
 	dst.buf[0].fd = fi->fh;
 	dst.buf[0].pos = offset;
 
-        trim_fs(fuse_buf_size(buf));
-        for (res = fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK); res == -ENOSPC; res = fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK)) {
-            fprintf(stderr, "device_size: %ld; fuse_buf_size(buf): %ld\n", device_size(RFS_DATA->rootdir), fuse_buf_size(buf));
-            if (device_size(RFS_DATA->rootdir) < fuse_buf_size(buf) || delete_oldest() != 0) {
-                break;
-            }
+    size_t bufsize = fuse_buf_size(buf);
+    trim_fs(bufsize);
+
+    size_t cap = options.max_device_size;
+    res = fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK);
+    while (res == -ENOSPC) {
+        if (cap > 0 && cap < bufsize) {
+            break;
         }
+        fprintf(stderr, "Fallback trim: cap %zu, buf size %zu\n", cap, bufsize);
+        if (delete_oldest() != 0) {
+            break;
+        }
+        res = fuse_buf_copy(&dst, buf, FUSE_BUF_SPLICE_NONBLOCK);
+    }
 
 	return res;
 }
@@ -620,6 +702,16 @@ static int rfs_statfs(const char *path, struct statvfs *stbuf)
 	res = statvfs(fpath, stbuf);
 	if (res == -1)
 		return -errno;
+
+    if (options.max_device_size > 0) {
+        size_t cap = options.max_device_size;
+        size_t used = current_size(RFS_DATA->rootdir);
+        stbuf->f_blocks = cap / stbuf->f_bsize;
+        stbuf->f_bfree = stbuf->f_bavail = (cap > used ? (cap - used) / stbuf->f_bsize : 0);
+        // Arbitrary large numbers for inodes
+        stbuf->f_files = 100000;
+        stbuf->f_ffree = 99999;
+    }
 
 	return 0;
 }
@@ -808,13 +900,6 @@ void rfs_usage()
     abort();
 }
 
-#define OPTION(t, p) { t, offsetof(struct options, p), 0 }
-static const struct fuse_opt option_spec[] = {
-    OPTION("--size=%zu", max_device_size),
-    OPTION("-s %zu", max_device_size),
-    FUSE_OPT_END
-};
-
 int main(int argc, char *argv[])
 {
     int fuse_stat, i;
@@ -852,16 +937,43 @@ int main(int argc, char *argv[])
     fprintf(stderr, "rootdir: %s\n", rfs_data->rootdir);
 
     options.max_device_size = 0;    // default value
-    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-    if (fuse_opt_parse(&args, &options, option_spec, NULL) == -1)
-        rfs_usage();
-    fprintf(stderr, "options.max_device_size: %lu\n", options.max_device_size);
-    fprintf(stderr, "device_size(): %lu\n", device_size(rfs_data->rootdir));
-    //fprintf(stderr, "current_size(): %lu\n", current_size(rfs_data->rootdir));
+
+    // Manually parse and remove size options
+    for (i = 1; i < argc; ) {  // Start from 1 (prog name at 0), increment manually
+        if (strcmp(argv[i], "-s") == 0) {
+            i++;
+            if (i >= argc) {
+                rfs_usage();
+            }
+            if (parse_size(argv[i], &options.max_device_size) != 0) {
+                fprintf(stderr, "Invalid size value: %s\n", argv[i]);
+                rfs_usage();
+            }
+            // Remove -s and value
+            memmove(&argv[i-1], &argv[i+1], sizeof(char *) * (argc - i));
+            argc -= 2;
+            // Do not increment i, as contents shifted
+            continue;
+        } else if (strncmp(argv[i], "--size=", 7) == 0) {
+            if (parse_size(argv[i] + 7, &options.max_device_size) != 0) {
+                fprintf(stderr, "Invalid size value: %s\n", argv[i] + 7);
+                rfs_usage();
+            }
+            // Remove the --size=... arg
+            memmove(&argv[i], &argv[i+1], sizeof(char *) * (argc - i));
+            argc -= 1;
+            // Do not increment i
+            continue;
+        }
+        i++;
+    }
+
+    fprintf(stderr, "options.max_device_size: %zu\n", options.max_device_size);
 
     rfs_data->files_traversed = 0;
 
     // turn over control to fuse
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     fuse_stat = fuse_main(args.argc, args.argv, &rfs_oper, rfs_data);
     
     return fuse_stat;
