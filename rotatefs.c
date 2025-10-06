@@ -54,6 +54,7 @@ struct rfs_state {
 
 static struct options {
     size_t max_device_size;
+    char *logfile;
 } options;
 
 static int parse_size(const char *str, size_t *result) {
@@ -896,14 +897,16 @@ static struct fuse_operations rfs_oper = {
 
 void rfs_usage()
 {
-    fprintf(stderr, "usage:  rotatefs [FUSE and mount options] rootDir mountPoint [-s <fs_size>|--size=<fs_size>]\n");
+    fprintf(stderr, "usage:  rotatefs [FUSE and mount options] rootDir mountPoint [-s <fs_size>|--size=<fs_size>] [-l <logfile>|--logfile=<logfile>]\n");
+    fprintf(stderr, "FUSE options include -f (foreground) and -d (debug).\n");
     abort();
 }
 
 int main(int argc, char *argv[])
 {
-    int fuse_stat, i;
+    int fuse_stat;
     struct rfs_state *rfs_data;
+    int root_idx = -1, mount_idx = -1;
 
     umask(0);
 
@@ -911,46 +914,31 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Fuse library version %d.%d\n", FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
     // Perform some sanity checking on the command line:  make sure
-    // there are enough arguments, and that neither of the last two
-    // start with a hyphen (this will break if you actually have a
-    // rootpoint or mountpoint whose name starts with a hyphen, but so
-    // will a zillion other programs)
+    // there are enough arguments
     if ((argc < 3)) {
-        for (i = 0; i < argc; i++)
+        for (int i = 0; i < argc; i++)
             fprintf(stderr, "argv[%d]: %s\n", i, argv[i]);
         rfs_usage();
     }
 
-    rfs_data = malloc(sizeof(struct rfs_state));
-    if (rfs_data == NULL) {
-	perror("main calloc");
-	abort();
-    }
-    // Pull the rootdir out of the argument list and save it in my
-    // internal data
-    rfs_data->rootdir = realpath(argv[1], NULL);
-    for (i = 2; i < argc; i++) {
-        argv[i-1] = argv[i];
-    }
-    argv[argc-1] = NULL;
-    argc--;
-    fprintf(stderr, "rootdir: %s\n", rfs_data->rootdir);
-
     options.max_device_size = 0;    // default value
+    options.logfile = NULL;
 
-    // Manually parse and remove size options
-    for (i = 1; i < argc; ) {  // Start from 1 (prog name at 0), increment manually
+    // Manually parse and remove custom options (-s/--size, -l/--logfile) FIRST
+    // Loop carefully, as removals shift indices
+    for (int i = 1; i < argc; ) {
         if (strcmp(argv[i], "-s") == 0) {
-            i++;
-            if (i >= argc) {
+            int val_i = i + 1;
+            if (val_i >= argc || argv[val_i][0] == '-') {
+                fprintf(stderr, "Missing value after -s\n");
                 rfs_usage();
             }
-            if (parse_size(argv[i], &options.max_device_size) != 0) {
-                fprintf(stderr, "Invalid size value: %s\n", argv[i]);
+            if (parse_size(argv[val_i], &options.max_device_size) != 0) {
+                fprintf(stderr, "Invalid size value: %s\n", argv[val_i]);
                 rfs_usage();
             }
-            // Remove -s and value
-            memmove(&argv[i-1], &argv[i+1], sizeof(char *) * (argc - i));
+            // Remove -s and value: memmove from i to end-2 left by 2
+            memmove(&argv[i], &argv[i + 2], sizeof(char *) * (argc - i - 2));
             argc -= 2;
             // Do not increment i, as contents shifted
             continue;
@@ -959,22 +947,148 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "Invalid size value: %s\n", argv[i] + 7);
                 rfs_usage();
             }
-            // Remove the --size=... arg
-            memmove(&argv[i], &argv[i+1], sizeof(char *) * (argc - i));
+            // Remove --size=...: memmove from i to end-1 left by 1
+            memmove(&argv[i], &argv[i + 1], sizeof(char *) * (argc - i - 1));
             argc -= 1;
             // Do not increment i
+            continue;
+        } else if (strcmp(argv[i], "-l") == 0) {
+            int val_i = i + 1;
+            if (val_i >= argc || argv[val_i][0] == '-') {
+                fprintf(stderr, "Missing value after -l\n");
+                rfs_usage();
+            }
+            if (options.logfile) free(options.logfile);
+            options.logfile = strdup(argv[val_i]);
+            if (!options.logfile) {
+                perror("strdup logfile");
+                abort();
+            }
+            // Remove -l and value
+            memmove(&argv[i], &argv[i + 2], sizeof(char *) * (argc - i - 2));
+            argc -= 2;
+            continue;
+        } else if (strncmp(argv[i], "--logfile=", 10) == 0) {
+            if (options.logfile) free(options.logfile);
+            options.logfile = strdup(argv[i] + 10);
+            if (!options.logfile) {
+                perror("strdup logfile");
+                abort();
+            }
+            // Remove --logfile=...
+            memmove(&argv[i], &argv[i + 1], sizeof(char *) * (argc - i - 1));
+            argc -= 1;
             continue;
         }
         i++;
     }
 
+    // Now find positional arguments in the cleaned argv
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-') {
+            if (root_idx == -1) {
+                root_idx = i;
+            } else if (mount_idx == -1) {
+                mount_idx = i;
+            } else {
+                fprintf(stderr, "Too many positional arguments: %s\n", argv[i]);
+                rfs_usage();
+            }
+        }
+    }
+    if (root_idx == -1 || mount_idx == -1) {
+        fprintf(stderr, "Missing rootDir or mountPoint\n");
+        rfs_usage();
+    }
+
+    rfs_data = malloc(sizeof(struct rfs_state));
+    if (rfs_data == NULL) {
+        perror("main calloc");
+        abort();
+    }
+
+    // Set rootdir from the original argv[root_idx]
+    rfs_data->rootdir = realpath(argv[root_idx], NULL);
+    if (rfs_data->rootdir == NULL) {
+        perror("realpath rootdir");
+        abort();
+    }
+    fprintf(stderr, "rootdir: %s\n", rfs_data->rootdir);
+
+    // Remove rootdir from argv by shifting subsequent args left
+    memmove(&argv[root_idx], &argv[root_idx + 1], sizeof(char *) * (argc - root_idx));
+    argc--;
+
+    // Adjust mount_idx if necessary
+    if (mount_idx > root_idx) {
+        mount_idx--;
+    }
+
     fprintf(stderr, "options.max_device_size: %zu\n", options.max_device_size);
+    if (options.logfile) {
+        fprintf(stderr, "logfile: %s\n", options.logfile);
+    }
+
+    // Redirect stderr to logfile if specified, BEFORE daemonizing
+    if (options.logfile) {
+        int logfd = open(options.logfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (logfd >= 0) {
+            if (dup2(logfd, STDERR_FILENO) == -1) {
+                perror("dup2 to logfile");
+            }
+            close(logfd);
+        } else {
+            perror("Failed to open logfile");
+        }
+        
+        // If logfile is specified and -f is NOT present, ensure we run in background
+        // Check if -f or --foreground is in argv
+        int has_foreground = 0;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--foreground") == 0) {
+                has_foreground = 1;
+                break;
+            }
+        }
+        
+        // If no explicit -f, we need to ensure background mode even with -d
+        // We'll add -o default_permissions to trigger daemon mode behavior
+        if (!has_foreground) {
+            // Daemonize manually before FUSE takes over
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                exit(1);
+            }
+            if (pid > 0) {
+                // Parent exits
+                exit(0);
+            }
+            // Child continues
+            setsid();
+            // Close stdin, stdout (stderr already redirected)
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            // Reopen as /dev/null
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                dup2(devnull, STDOUT_FILENO);
+                if (devnull > 2) close(devnull);
+            }
+        }
+    }
 
     rfs_data->files_traversed = 0;
 
-    // turn over control to fuse
+    // turn over control to fuse (now argv has FUSE options + mountpoint as last)
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     fuse_stat = fuse_main(args.argc, args.argv, &rfs_oper, rfs_data);
+    
+    // Cleanup
+    if (options.logfile) free(options.logfile);
+    free(rfs_data->rootdir);
+    free(rfs_data);
     
     return fuse_stat;
 }
